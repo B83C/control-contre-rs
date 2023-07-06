@@ -438,7 +438,7 @@ lazy_static! {
 fn save(data: &MemConfig, path: Option<&Path>) {
     File::create(path.unwrap_or(CONFIG_PATH.as_path()))
         .expect("Unable to create configuration file")
-        .write(
+        .write_all(
             toml::to_string(data.deref())
                 .expect("Unable to generate default toml configuration")
                 .as_bytes(),
