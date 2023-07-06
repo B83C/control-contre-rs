@@ -1,9 +1,11 @@
 #![feature(async_closure)]
 #![feature(let_chains)]
 #![feature(const_for)]
+#![feature(result_option_inspect)]
 
 use ahash::AHasher;
 use interpolator::{format, Formattable};
+use rfd::{FileDialog, MessageDialog, MessageLevel, MessageButtons};
 
 use iced::{
     keyboard::{self, Modifiers},
@@ -18,17 +20,19 @@ use iced_aw::{
     Modal,
 };
 
-use indexmap::IndexMap;
+use rbl_circular_buffer::*;
+use indexmap::{IndexMap, IndexSet, Equivalent};
 
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, net::ToSocketAddrs, time::Duration, path::{PathBuf, Path}, fmt::Display, sync::atomic::AtomicU32, hash::Hash};
 use std::{iter::once, thread};
+use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 use tokio_retry::Action;
 
-use ringbuf::{HeapRb, Rb};
+use st3::fifo::Worker;
 use std::{
     fs::{self, File, OpenOptions},
-    ops::Deref,
+    ops::{Deref, DerefMut},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -37,7 +41,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use async_mutex::Mutex;
+use serde_hex::{SerHexOpt, Compact};
+
 use circular_buffer::CircularBuffer;
 use std::io::Read;
 use std::io::Write;
@@ -62,16 +67,23 @@ use iced_aw::card::Card;
 use iced_aw::style::card::CardStyles;
 
 use async_ssh2_lite::AsyncSession;
-use russh::*;
+use async_ssh2_lite::{session_stream::AsyncSessionStream, SessionConfiguration};
 
 type AIndexMap<K, V> = IndexMap<K, V, AHasher>;
 
 use lazy_static::lazy_static;
-use regex::Regex;
+use regex::{Regex, SubCaptureMatches};
+
+use chrono::{Local, DateTime};
 
 lazy_static! {
-    static ref RE: Regex = Regex::new(r"\{(.*\#)?(\w*)(.*)\}").unwrap();
+    static ref RE: Regex = Regex::new(r"\{(\w*\#?\w*)(.*)\}").unwrap();
 }
+
+use qcell::{TCell, TCellOwner};
+struct Marker;
+type ACell<T> = TCell<Marker, T>;
+type ACellOwner = TCellOwner<Marker>;
 
 const AUTH_FAILED: char = '\u{e99a}';
 const DISCONNECTED: char = '\u{f239}';
@@ -88,6 +100,15 @@ const ADD_ACTION: char = '\u{e146}';
 const SELECT: char = '\u{f74d}';
 const DESELECT: char = '\u{ebb6}';
 const DONE: char = '\u{e876}';
+const SCREENSHOT: char = '\u{ec08}';
+
+#[derive(Debug, Clone)]
+pub enum ConfigAction {
+    Save,
+    Export,
+    Import,
+    Open,
+}
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -97,14 +118,14 @@ pub enum Message {
     PortInput(String),
     ActionAdd,
     AddrAdd,
-    AddrDel(Addr),
+    AddrDel(usize),
     AddrDelAll,
     AddrDeselAll,
     UpdateAddrSel(bool, usize),
     Action(ActionState, usize, bool),
     SelectAction,
     DelectAction,
-    SaveConfig,
+    Config(ConfigAction),
     None,
 }
 
@@ -112,39 +133,87 @@ pub enum Message {
 pub enum Dialog {
     Main,
     AddAction,
-    ArgumentsForAction(usize, Arc<Vec<Argument>>),
+    ArgumentsForAction(usize, ArgumentsMap),
     Logs(usize, bool),
 }
 
-#[derive(Deserialize, Clone, Serialize, Hash, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Addr {
+#[derive(Deserialize, Serialize)]
+struct Client {
+    address: Arc<str>,
+    port: u16,
+    #[serde(skip)]
+    selected: AtomicBool,
+    #[serde(skip, default = "default_cell")]
+    connection: Arc<ACell<Option<AsyncSession<async_ssh2_lite::TokioTcpStream>>>>,
+    #[serde(skip, default = "default_log")]
+    output: ACell<CircularBuffer<1024, Log>>,
+    #[serde(skip, default = "default_state")]
+    state: AtomicU32,
+}
+
+impl Hash for Client {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.address.hash(state);
+        self.port.hash(state);
+    }
+}
+
+impl PartialEq for Client {
+    fn eq(&self, other: &Self) -> bool {
+        self.address == other.address && self.port == other.port
+    }
+}
+
+impl Eq for Client {}
+
+#[derive(Deserialize, Serialize, Hash, PartialEq, Eq)]
+struct Addr
+{
     address: Arc<str>,
     port: u16,
 }
 
-#[derive(Default)]
-struct Client {
-    selected: AtomicBool,
-    connection: Arc<Mutex<Connection<SshClient>>>,
-}
 
-struct Connection<T: russh::client::Handler> {
-    handle: Option<russh::client::Handle<T>>,
-    stdout: HeapRb<u8>,
-    stderr: HeapRb<u8>,
-    state: char,
-}
-
-impl<T: russh::client::Handler> Default for Connection<T> {
-    fn default() -> Self {
-        Self {
-            handle: None,
-            stdout: HeapRb::new(16384),
-            stderr: HeapRb::new(16384),
-            state: DISCONNECTED,
-        }
+impl Equivalent<Addr> for Client {
+    fn equivalent(&self, key: &Addr) -> bool {
+        self.address == key.address && self.port == key.port
+        
     }
 }
+
+
+fn default_cell() -> Arc<ACell<Option<AsyncSession<async_ssh2_lite::TokioTcpStream>>>> {
+    Arc::new(ACell::new(None))
+}
+
+const fn default_log() -> ACell<CircularBuffer<1024, Log>> {
+    ACell::new(CircularBuffer::new())
+}
+
+fn default_state() -> AtomicU32 {
+   AtomicU32::new(DISCONNECTED.into())
+}
+
+impl Default for Client {
+    fn default() -> Self {
+        Self {
+            address: "".into(),
+            port: 22,
+            selected: Default::default(),
+            connection: default_cell(),
+            output: default_log(),
+            state: default_state(),
+        }
+        
+    }
+}
+
+struct Log {
+    stdout: String,
+    stderr: String,
+    timestamp: DateTime<Local>,
+}
+
 
 struct ActionStyle;
 
@@ -180,28 +249,65 @@ impl StyleSheet for ActionStyleSelection {
     }
 }
 
-#[derive(Clone, Deserialize, Serialize, Hash, Debug, PartialEq, Eq, PartialOrd)]
+
+type ArgumentsMap = Arc<IndexSet<String>>;
+#[derive(Deserialize, Serialize)]
 pub struct ActionDesc {
     description: Arc<str>,
-    command: Arc<str>,
-    logo: Option<Arc<str>>,
+    command: String,
+    // #[serde(with = "SerHexOpt::<Compact>")]
+    logo: Option<u32>,
     #[serde(skip)]
-    logo_de: Option<char>,
-    #[serde(skip)]
-    command_de: Option<Arc<str>>,
-    #[serde(skip)]
-    arguments: Arc<Vec<Argument>>,
-}
-
-#[derive(Clone, Deserialize, Serialize, Hash, Debug, PartialEq, Eq, PartialOrd)]
-pub struct Argument {
-    name: Arc<str>,
-    default_value: Arc<str>,
-}
-
-#[derive(Default)]
-struct ActionEntry {
+    arguments: ArgumentsMap, 
+    #[serde(skip, default="atomicbool_default")]
     selected: AtomicBool,
+}
+
+fn atomicbool_default() -> AtomicBool {
+    AtomicBool::new(true)
+}
+
+impl Hash for ActionDesc {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.description.hash(state);
+        self.command.hash(state);
+    }
+}
+
+impl PartialEq for ActionDesc {
+    fn eq(&self, other: &Self) -> bool {
+        self.description == other.description && self.logo == other.logo 
+    }
+}
+
+impl Eq for ActionDesc {}
+
+impl ActionDesc {
+    fn new(description : Arc<str>, command: String, logo: Option<u32>, selected: AtomicBool) -> Self {
+        let args =  Self::generate_args(&command);
+Self {
+            description,
+            command, 
+            logo,
+            selected,
+            arguments: args,
+        }
+       
+    }
+
+    fn generate_args(command: &str) -> ArgumentsMap {
+        let args = 
+            Arc::new(RE
+                    .captures_iter(&command)
+                    .filter_map(|caps| {
+                        caps.get(1).map(|name| {
+                            name.as_str().to_owned()
+                        })
+                    })
+                    .collect());       
+        args
+        
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -211,9 +317,35 @@ pub enum ActionState {
     None,
 }
 
+#[derive(Debug)]
+enum ConfigError {
+    IO(std::io::ErrorKind),
+    Toml(toml::de::Error),
+}
+
+impl From<std::io::Error> for ConfigError {
+    fn from(value: std::io::Error) -> Self {
+        Self::IO(value.kind())
+    }
+}
+impl From<toml::de::Error> for ConfigError {
+    fn from(value: toml::de::Error) -> Self {
+        Self::Toml(value)
+    }
+}
+
+impl Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigError::IO(io) =>  write!(f, "IO Error : {}", io),
+            ConfigError::Toml(toml) => write!(f, "Toml Parsing Error : {}", toml),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Config {
-    clients: Vec<Addr>,
+    clients: IndexSet<Arc<Client>>,
     actions: Vec<ActionDesc>,
     password: Arc<str>,
     user: Arc<str>,
@@ -230,8 +362,71 @@ impl Default for Config {
     }
 }
 
+#[derive(Default)]
+struct DiskConfig(Config);
+
+#[derive(Default)]
+struct MemConfig(Config);
+
+impl Deref for DiskConfig {
+    type Target = Config;
+    
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Deref for MemConfig{
+    type Target = Config;
+    
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl DerefMut for MemConfig{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+// impl From<&MemConfig> for &DiskConfig {
+//     fn from(data: &MemConfig) -> Self {
+//         &DiskConfig(&data.0)
+//     }
+// }
+
+impl DiskConfig {
+    fn load(path: &Path) -> Result<Self, ConfigError> {
+
+        let mut handle = OpenOptions::new()
+                .write(true)
+                .read(true)
+                .open(path)?;      
+
+        let mut conf = String::new();
+        handle.read_to_string(&mut conf)?;
+        toml::from_str(&conf).map_err(|e| ConfigError::Toml(e)).map(|c| DiskConfig(c))
+    }
+        
+}
+
+impl From<DiskConfig> for MemConfig {
+    fn from(data: DiskConfig) -> Self {
+
+        let DiskConfig(mut conf) = data;
+
+        conf.actions.iter_mut().for_each(|a| {
+            a.arguments = ActionDesc::generate_args(&a.command);
+        });
+
+        MemConfig(conf)
+
+    }
+}
+
+
 lazy_static! {
-    static ref config_path: std::path::PathBuf = {
+    static ref CONFIG_PATH: std::path::PathBuf = {
         let sp = standard_paths::default_paths!()
             .writable_location(LocationType::AppConfigLocation)
             .expect("Unable to get configuration path");
@@ -240,18 +435,11 @@ lazy_static! {
     };
 }
 
-fn save(data: &Config) {
-    // let conf = Config {
-    //     clients: data.clients.into_keys().collect(),
-    //     actions: data.actions.into_keys().collect(),
-    //     password: data.password.clone(),
-    //     user: data.user.clone(),
-    // };
-
-    File::create(config_path.as_path())
+fn save(data: &MemConfig, path: Option<&Path>) {
+    File::create(path.unwrap_or(CONFIG_PATH.as_path()))
         .expect("Unable to create configuration file")
         .write(
-            toml::to_string(&data)
+            toml::to_string(data.deref())
                 .expect("Unable to generate default toml configuration")
                 .as_bytes(),
         )
@@ -259,14 +447,10 @@ fn save(data: &Config) {
 }
 
 struct Data {
-    clients: IndexMap<Addr, Client>,
-    actions: IndexMap<ActionDesc, ActionEntry>,
-    password: Arc<str>,
-    user: Arc<str>,
+    config: MemConfig,
 
     clients_version: AtomicUsize,
     actions_version: AtomicUsize,
-    config: Arc<russh::client::Config>,
     select_all: AtomicBool,
     // show_log: Option<CircularBuffer<16384, u8>>,
     client_addr_input: String,
@@ -277,33 +461,12 @@ struct Data {
     dialog_inputs: Vec<String>,
 }
 
-#[derive(Clone, Copy, Default)]
-struct SshClient;
-
-#[async_trait::async_trait]
-impl client::Handler for SshClient {
-    type Error = russh::Error;
-    async fn check_server_key(
-        self,
-        _: &russh_keys::key::PublicKey,
-    ) -> Result<(Self, bool), Self::Error> {
-        Ok((self, true))
-    }
-}
-
 impl Default for Data {
     fn default() -> Self {
         Data {
-            clients: [].into(),
-            actions: [].into(),
+            config: Default::default(),
             client_addr_input: String::new(),
             client_port_input: "22".into(),
-            password: "".into(),
-            user: "".into(),
-            config: Arc::new(russh::client::Config {
-                window_size: 16384,
-                ..Default::default()
-            }),
             select_all: AtomicBool::new(false),
             // show_log: None,
             select_actions: AtomicBool::new(false),
@@ -323,62 +486,17 @@ impl Application for Data {
     type Theme = Theme;
 
     fn new(_flags: ()) -> (Data, Command<Self::Message>) {
-        let Config {
-            clients,
-            actions,
-            password,
-            user,
-        } = match OpenOptions::new()
-            .write(true)
-            .read(true)
-            .open(config_path.as_path())
-        {
-            Ok(mut handle) => {
-                let mut conf = String::new();
-                handle
-                    .read_to_string(&mut conf)
-                    .expect("Unable to read configuration file");
-                toml::from_str(&conf).expect("Unable to parse configuaration file")
-            }
-            Err(err) => match err.kind() {
-                std::io::ErrorKind::NotFound => {
-                    let def = Default::default();
-                    save(&def);
-                    def
-                }
-                _ => {
-                    panic!("Unable to create/open configuration file");
-                }
-            },
-        };
-
-        let clients = clients
-            .into_iter()
-            .map(|c| (c, Default::default()))
-            .collect();
-
-        let actions = actions
-            .into_iter()
-            .map(|mut c| {
-                let args = RE
-                    .captures_iter(c.command.deref())
-                    .map(|caps| Argument {
-                        default_value: (caps.get(1).map(|s| s.as_str()).unwrap_or("")).into(),
-                        name: (caps.get(2).map(|s| s.as_str()).unwrap_or_else(|| todo!())).into(),
-                    })
-                    .collect();
-                c.arguments = Arc::new(args);
-                c.command_de = dbg!(Some(Arc::from(RE.replace_all(c.command.deref(), "{$2$3}"))));
-                (c, Default::default())
-            })
-            .collect();
+        let diskconfig = DiskConfig::load(CONFIG_PATH.as_path()).map_or_else(|e| {
+                if MessageDialog::new().set_level(MessageLevel::Warning).set_title(e.to_string().as_str()).set_description("Do you want to load default configuration?").set_buttons(MessageButtons::YesNo).show()  {
+                     Default::default()
+                    } else {
+                        panic!("No way of getting valid configuration")
+                    }                    
+        }, |v| v);
 
         (
             Data {
-                clients,
-                actions,
-                password,
-                user,
+                config: diskconfig.into(),
                 ..Default::default()
             },
             Command::none(),
@@ -397,17 +515,32 @@ impl Application for Data {
             Message::DialogInput(index, input) => {
                 self.dialog_inputs[index] = input;
             }
-            Message::SaveConfig => {
-                let conf = Config {
-                    clients: self.clients.keys().cloned().collect(),
-                    actions: self.actions.keys().cloned().collect(),
-                    password: self.password.clone(),
-                    user: self.user.clone(),
-                };
-                save(&conf);
+            Message::Config(action) => {
+                match action {
+                    ConfigAction::Save => save(&self.config, None),
+                    ConfigAction::Export =>  {
+                        if let Some(file) = FileDialog::new()
+                            .add_filter("Configuration", &["toml"])
+                            .save_file() {
+                        
+                        save(&self.config, Some(file.as_path()));
+                    }}
+                    ConfigAction::Open => {open::that(CONFIG_PATH.as_os_str()).ok();},
+                    ConfigAction::Import => {
+                        if let Some(file) = FileDialog::new()
+                            .add_filter("Configuration", &["toml"])
+                            .pick_file() {
+                            match  DiskConfig::load(file.as_path()) {
+                                Ok(config) =>  {self.config = config.into();},
+                                Err(e) =>  {MessageDialog::new().set_level(MessageLevel::Error).set_title("Unable to load config").set_description(e.to_string().as_str()).show();}
+                            }                    
+                        
+                    }
+                        }
+                }
             }
             Message::UpdateAddrSel(state, index) => {
-                if let Some((_, v)) = self.clients.get_index(index) {
+                if let Some(v) = self.config.clients.get_index(index) {
                     self.clients_version.fetch_add(1, Ordering::Relaxed);
                     v.selected.store(state, Ordering::Relaxed);
                 }
@@ -415,38 +548,13 @@ impl Application for Data {
             Message::DelectAction => {
                 self.actions_version.fetch_add(1, Ordering::Relaxed);
                 if self.select_actions.load(Ordering::Relaxed) {
-                    self.actions
-                        .retain(|_, a| !a.selected.load(Ordering::Relaxed));
+                    self.config.actions
+                        .retain(|a| !a.selected.load(Ordering::Relaxed));
                 }
             }
             Message::ActionAdd => {
-                let command: Arc<str> = Arc::from(self.dialog_inputs[2].as_str());
-                let command_de: Arc<str> = Arc::from(RE.replace_all(command.deref(), "{$2$3}"));
-                let args = RE
-                    .captures_iter(command.deref())
-                    .map(|caps| Argument {
-                        default_value: (caps.get(1).map(|s| s.as_str()).unwrap_or("")).into(),
-                        name: (caps.get(2).map(|s| s.as_str()).unwrap_or_else(|| todo!())).into(),
-                    })
-                    .collect();
-                self.actions.insert(
-                    ActionDesc {
-                        description: Arc::from(self.dialog_inputs[1].as_str()),
-                        command: command.clone(),
-                        logo: if self.dialog_inputs[0].trim().is_empty() {
-                            None
-                        } else {
-                            Some(Arc::from(self.dialog_inputs[0].as_str()))
-                        },
-                        logo_de: u32::from_str_radix(&self.dialog_inputs[0], 16)
-                            .map_or_else(|_| None, char::from_u32),
-                        command_de: Some(command_de),
-                        arguments: Arc::new(dbg!(args)),
-                    },
-                    ActionEntry {
-                        selected: false.into(),
-                    },
-                );
+                self.config.actions.push(
+                    ActionDesc::new(Arc::from(self.dialog_inputs[1].as_str()), self.dialog_inputs[2].to_owned(), u32::from_str_radix(&self.dialog_inputs[0], 16).ok(), atomicbool_default())                );
                 self.actions_version.fetch_add(1, Ordering::Relaxed);
             }
             Message::SelectAction => {
@@ -463,37 +571,37 @@ impl Application for Data {
             }
             Message::AddrAdd => {
                 if !self.client_addr_input.is_empty() {
-                    self.clients
-                        .entry(Addr {
+                self.clients_version.fetch_add(1, Ordering::Relaxed);
+                    self.config.clients.insert(
+                        Arc::new(Client {
                             address: Arc::from(self.client_addr_input.clone()),
                             port: self.client_port_input.parse().unwrap_or(22),
+                            ..Default::default()
+                            
                         })
-                        .or_insert_with(|| {
-                            self.clients_version.fetch_add(1, Ordering::Relaxed);
-                            Client {
-                                selected: AtomicBool::new(true),
-                                connection: Arc::new(Mutex::new(Default::default())),
-                            }
-                        });
+                    );
                 }
             }
-            Message::AddrDel(client) => {
+
+            Message::AddrDel(index) => {
                 self.clients_version.fetch_add(1, Ordering::Relaxed);
-                self.clients.remove(&client);
+
+                // todo!();
+                // self.config.clients.remove(&client);
             }
             Message::AddrDelAll => {
                 self.clients_version.fetch_add(1, Ordering::Relaxed);
-                self.clients.clear();
+                self.config.clients.clear();
             }
             Message::AddrDeselAll => {
                 self.clients_version.fetch_add(1, Ordering::Relaxed);
-                self.clients
+                self.config.clients
                     .iter()
-                    .for_each(|(_, c)| c.selected.store(false, Ordering::Relaxed));
+                    .for_each(|c| c.selected.store(false, Ordering::Relaxed));
             }
             // Message::ActionTileSelect()
             Message::Action(state, index, decode) => {
-                if let Some((ad, a)) = self.actions.get_index(index) {
+                if let Some(a) = self.config.actions.get(index) {
                     match state {
                         ActionState::Selection => {
                             self.actions_version.fetch_add(1, Ordering::Relaxed);
@@ -501,125 +609,84 @@ impl Application for Data {
                         }
                         ActionState::NeedArguments => {
                             self.current_dialog =
-                                Dialog::ArgumentsForAction(index, ad.arguments.clone());
+                                Dialog::ArgumentsForAction(index, a.arguments.clone());
                         }
                         ActionState::None => {
                             self.clients_version.fetch_add(1, Ordering::Relaxed);
-                            let config = self.config.clone();
-                            let user = self.user.clone();
-                            let password = self.password.clone();
+                            let user = self.config.user.clone();
+                            let password = self.config.password.clone();
                             let command = if decode {
                                 format(
-                                    ad.command_de.as_ref().unwrap().deref(),
-                                    &ad.arguments
-                                        .as_ref()
-                                        .into_iter()
-                                        .zip(self.dialog_inputs.iter())
-                                        .map(|(a, b)| (a.name.as_ref(), Formattable::display(b)))
-                                        .collect::<HashMap<_, _>>(),
+                                    a.command.as_ref(),
+                                    &a.arguments.as_ref().into_iter().map(|a| a.as_str()).zip(self.dialog_inputs.iter().map(|a| Formattable::display(a))).collect::<HashMap::<_, _>>()
                                 )
                                 .unwrap()
                             } else {
-                                ad.command.deref().to_owned()
+                                a.command.deref().to_owned()
                             };
-                            let clients: Vec<_> = self
+                            let clients: Vec<_> = self.config
                                 .clients
                                 .iter()
-                                .filter(|(_, c)| {
+                                .filter(|c| {
                                     c.selected.load(Ordering::Relaxed)
                                         || self.select_all.load(Ordering::Relaxed)
-                                })
-                                .map(|(a, c)| (a.address.clone(), a.port, c.connection.clone()))
+                                }).cloned()
                                 .collect();
 
                             return Command::perform(
                                 async move {
                                     tokio_scoped::scope(|s| {
-                                        for (addr, port, session) in &clients {
+                                        for c in &clients {
                                             s.spawn(async {
-                                                timeout(Duration::from_secs(5), async {
-                                                    if let Some(mut session) = session.try_lock() {
-                                                        let res: Result<_, russh::Error> = async {
-                                                            if session.handle.is_none() {
-                                                                let mut conn =
-                                                                    russh::client::connect(
-                                                                        config.clone(),
-                                                                        (addr.deref(), *port),
-                                                                        SshClient {},
-                                                                    )
-                                                                    .await?;
-                                                                if conn
-                                                                    .authenticate_password(
-                                                                        user.deref(),
-                                                                        password.deref(),
-                                                                    )
-                                                                    .await?
-                                                                {
-                                                                    session.handle = Some(conn);
-                                                                } else {
-                                                                    todo!();
+                                                        let res: Result<_, async_ssh2_lite::Error> =
+                                                            async {
+                                                                for _ in 0..3 {
+                                                                    let mut owner = ACellOwner::new();
+                                                                    if let Some(ref session) = owner.ro(c.connection.deref()) {
+                                                                        let mut channel = session.channel_session().await?;
+                                                                        channel.exec(&command).await?;
+                                                                        let mut stdout = String::new();
+                                                                        let mut stderr = String::new();
+                                                                        channel.read_to_string(&mut stdout).await?;
+                                                                        channel.stderr().read_to_string(&mut stderr).await?;
+                                                                        c.output.rw(&mut owner).push_back(Log { stdout, stderr, timestamp: chrono::offset::Local::now()});
+                                                                        channel.close().await?;
+                                                                        return Ok(if channel.exit_status()? == 0 {SUCCESSFUL} else {ERROR} );
+                                                                    }
+                                                                    else {
+                                                                        let addr = (c.address.deref(), c.port).to_socket_addrs().map_err(|x| async_ssh2_lite::Error::Other(Box::new(x)))?.next().unwrap();
+
+                                                                        let mut conf = SessionConfiguration::new();
+                                                                        conf.set_timeout(5000);
+                                                                    
+                                                                        let mut conn =
+                                                                            AsyncSession::<async_ssh2_lite::TokioTcpStream>::connect(
+                                                                                addr,
+                                                                                conf,
+                                                                            )
+                                                                            .await?;
+                                                                        conn.handshake().await?;
+                                                                        dbg!(conn.userauth_password(&user, &password).await)?;
+                                                                        *c.connection.rw(&mut owner) = Some(conn);
+                                                                    }
                                                                 }
-                                                            }
-                                                            if let Some(conn) =
-                                                                session.handle.as_mut()
-                                                            {
-                                                                let mut sess = conn
-                                                                    .channel_open_session()
-                                                                    .await?;
 
-                                                                sess.exec(true, command.as_bytes())
-                                                                    .await?;
-                                                                while let Some(msg) =
-                                                                    sess.wait().await
-                                                                {
-                                                                    match msg {
-                                                        russh::ChannelMsg::ExtendedData {
-                                                            ref data,
-                                                            ..
-                                                        } => {
-                                                            session
-                                                                .stderr
-                                                                .push_slice_overwrite(data.deref());
-                                                        }
-                                                        russh::ChannelMsg::Data { ref data } => {
-                                                            session
-                                                                .stdout
-                                                                .push_slice_overwrite(data.deref());
-                                                        }
-                                                        russh::ChannelMsg::ExitStatus {
-                                                            exit_status,
-                                                        } => {
-                                                            if exit_status == 0 {
-                                                                return Ok(SUCCESSFUL);
-                                                            } else {
-                                                                return Ok(ERROR);
+                                                                Ok(UNKNOWN)
                                                             }
-                                                        }
-                                                        _ => {}
-                                                    }
-                                                                }
-                                                                sess.close().await?;
-                                                            }
+                                                            .await;
 
-                                                            Ok(UNKNOWN)
-                                                        }
-                                                        .await;
-
-                                                        session.state = match dbg!(res) {
+                                                         let state = match dbg!(res) {
                                                             Ok(state) => state,
-                                                            Err(err) => match err {
-                                                                russh::Error::NotAuthenticated => {
+                                                            Err(err) => { use async_ssh2_lite::Error; match err {
+                                                                Error::Ssh2(err)=> {
                                                                     AUTH_FAILED
                                                                 }
-                                                                russh::Error::Disconnect
-                                                                | russh::Error::HUP => DISCONNECTED,
                                                                 _ => UNKNOWN,
-                                                            },
-                                                        }
-                                                    }
-                                                })
-                                                .await
-                                                .ok();
+                                                            }},
+                                                        };
+                                                c.state.store(state as u32, Ordering::Relaxed);
+
+
                                             });
                                         }
                                     });
@@ -635,33 +702,38 @@ impl Application for Data {
         Command::none()
     }
 
+
     fn view(&self) -> Element<Self::Message> {
+        let menu_button = |label: &str, msg: Message|  menu_tree!(button(text(label).width(Length::Fill).height(Length::Fill).vertical_alignment(alignment::Vertical::Center)).on_press(msg));
         dbg!("Update");
 
-        // let menu = menu_bar!(menu_tree("test", vec![menu_tree!("he")]));
+        let menu = menu_bar!(menu_tree("Configuration", vec![menu_button("Save (Ctrl + S)", Message::Config(ConfigAction::Save)), menu_button("Import", Message::Config(ConfigAction::Import)), menu_button("Export", Message::Config(ConfigAction::Export)), menu_button("View", Message::Config(ConfigAction::Open))]));
         let clients = lazy(self.clients_version.load(Ordering::Relaxed), |_| {
             scrollable(
                 container(Column::with_children(
-                    self.clients
+                    self.config.clients
                         .iter()
                         .enumerate()
-                        .map(|(i, (a, c))| {
+                        .map(|(i, c)| {
                             row![
                                 checkbox(
-                                    a.address.deref(),
+                                    c.address.deref(),
                                     c.selected.load(Ordering::Relaxed)
                                         || self.select_all.load(Ordering::Relaxed),
                                     move |state| { Message::UpdateAddrSel(state, i) }
                                 )
                                 .width(Length::Fill),
-                                text(a.port.to_string()).width(Length::Fill),
+                                text(c.port.to_string()).width(Length::Fill),
                                 icon(
-                                    c.connection.try_lock().map(|c| c.state).unwrap_or(UNKNOWN),
+                                    unsafe {char::from_u32_unchecked(c.state.load(Ordering::Relaxed))}
+                                    ,
                                     40
                                 ),
                                 button(icon(VIEW_LOG, 30))
                                     .on_press(Message::ShowDialog(Dialog::Logs(i, false)))
                                     .style(theme::Button::Text),
+                                button(icon(SCREENSHOT, 30))
+                                    // .on_press(Message::ShowDialog())
                                 // button(icon(VIEW_ERROR_LOG, 30))
                                 //     .on_press(Message::ViewLog(b.stderr))
                                 //     .style(theme::Button::Text),
@@ -712,11 +784,11 @@ impl Application for Data {
 
         let actions = lazy(self.actions_version.load(Ordering::Relaxed), |_| {
             iced_aw::Wrap::with_elements(
-                self.actions
+                self.config.actions
                     .iter()
                     .enumerate()
-                    .map(|(i, (ad, a))| {
-                        let logo: Element<Self::Message> = if let Some(logo) = ad.logo_de {
+                    .map(|(i, a)| {
+                        let logo: Element<Self::Message> = if let Some(logo) = a.logo.map_or(None, |a| char::from_u32(a)){
                             icon(logo, 50).into()
                         } else {
                             row![].into()
@@ -726,7 +798,7 @@ impl Application for Data {
                                 container(
                                     column![
                                         logo,
-                                        text(ad.description.deref())
+                                        text(a.description.deref())
                                             .horizontal_alignment(alignment::Horizontal::Center)
                                             .vertical_alignment(alignment::Vertical::Center)
                                     ]
@@ -740,7 +812,7 @@ impl Application for Data {
                             .on_press(Message::Action(
                                 if self.select_actions.load(Ordering::Relaxed) {
                                     ActionState::Selection
-                                } else if ad.arguments.len() > 0 {
+                                } else if a.arguments.len() > 0 {
                                     ActionState::NeedArguments
                                 } else {
                                     ActionState::None
@@ -805,20 +877,13 @@ impl Application for Data {
         let view: Element<Message> = match self.current_dialog {
             Dialog::Main => content.into(),
             Dialog::Logs(index, show_error) => Modal::new(true, content, move || {
-                let output = if let Some((_, client)) = self.clients.get_index(index) {
-                    if let Some(session) = client.connection.try_lock() {
-                        let (head, end) = if show_error {
-                            session.stderr.as_slices()
-                        } else {
-                            session.stdout.as_slices()
-                        };
-                        String::from_utf8([head, end].concat())
-                            .unwrap_or("Unable to concat logs".into())
-                    } else {
-                        "Still Executing".into()
-                    }
+                let owner = ACellOwner::new();
+                let output = if let Some(client) = self.config.clients.get_index(index) {
+                    column(client.output.ro(&owner).iter().rev().map(|o| {
+                        Card::new(text(o.timestamp.to_string()), text(if show_error { o.stderr.clone() } else {o.stdout.clone()}))
+                    }).map(Element::from).collect())
                 } else {
-                    "Invalid client".into()
+                    column![text("Unable to load logs")]
                 };
                 scrollable(
                     Card::new(
@@ -827,7 +892,7 @@ impl Application for Data {
                             checkbox("Show Error", show_error, move |state| Message::ShowDialog(
                                 Dialog::Logs(index, state)
                             )),
-                            text(output).width(Length::Fill)
+                            output
                         ])
                         .width(Length::Fixed(500.0))
                         .padding(20)
@@ -893,14 +958,17 @@ impl Application for Data {
                                 arguments
                                     .iter()
                                     .enumerate()
-                                    .map(|(i, a)| {
+                                    .filter_map(|(i, a)| {
+                                        let mut arg = a.split('#');
+                                        arg.next().map(|a| {
                                         row![
-                                            text(&a.name),
-                                            text_input(&a.default_value, &self.dialog_inputs[i],)
+                                            text(a),
+                                            text_input(arg.next().unwrap_or(""), &self.dialog_inputs[i],)
                                                 .width(Length::Fill)
                                                 .on_input(move |str| Message::DialogInput(i, str))
                                         ]
                                         .spacing(20)
+                                        })
                                     })
                                     .map(Element::from)
                                     .collect(),
@@ -933,13 +1001,15 @@ impl Application for Data {
             }
         };
 
-        scrollable(
+        let cont = scrollable(
             container(view)
                 .width(Length::Fill)
                 .padding(40)
                 .align_x(iced::alignment::Horizontal::Center)
                 .center_x(),
-        )
+        );
+
+        column![menu, cont]
         .into()
     }
 
@@ -959,7 +1029,7 @@ impl Application for Data {
                     modifiers: Modifiers::CTRL,
                 }),
                 _,
-            ) => Some(Message::SaveConfig),
+            ) => Some(Message::Config(ConfigAction::Save)),
 
             _ => None,
         })

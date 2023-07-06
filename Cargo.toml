@@ -8,11 +8,13 @@ edition = "2021"
 [dependencies]
 ahash = "0.8.3"
 async-mutex = "1.4.0"
-async-ssh2-lite = { version = "0.4.5", features = ["async-io"] }
+async-ssh2-lite = { version = "0.4.5", features = ["tokio"] }
 async-std = "1.12.0"
 async-trait = "0.1.68"
 atomic_enum = "0.2.0"
+chrono = "0.4.26"
 circular-buffer = "0.1.1"
+compact_str = { version = "0.7.1", features = ["rkyv"] }
 derive-where = "1.2.1"
 glob-match = "0.2.1"
 iced = { version = "0.9.0", features = ["tokio"] }
@@ -21,13 +23,19 @@ iced_lazy = "0.6.1"
 indexmap = { version = "2.0.0", features = ["serde"] }
 interpolator = "0.5.0"
 lazy_static = "1.4.0"
+open = "5.0.0"
+qcell = "0.5.3"
 rayon = "1.7.0"
+rbl_circular_buffer = "0.1.2"
 regex = "1.8.4"
+rfd = "0.11.4"
 ringbuf = "0.3.3"
 russh = { version = "0.37.1", features = ["openssl"] }
 russh-keys = "0.37.1"
 serde = { version = "1.0.164", features = ["serde_derive", "rc"] }
+serde-hex = "0.1.0"
 ssh-rs = "0.3.2"
+st3 = "0.4.1"
 standard_paths = "2.0.1"
 tokio = { version = "1.28.2", features = ["time"] }
 tokio-retry = "0.3.0"
