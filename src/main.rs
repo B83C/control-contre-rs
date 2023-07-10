@@ -12,12 +12,13 @@ use ahash::AHasher;
 use async_mutex::Mutex;
 use interpolator::{format, Formattable};
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageLevel};
-use tokio::io::AsyncReadExt;
+use tokio::{io::AsyncReadExt, time::timeout};
 
 use iced::{
+    clipboard,
     keyboard::{self, Modifiers},
     subscription,
-    widget::{image, pick_list::Handle, tooltip, tooltip::Position},
+    widget::{horizontal_space, image, pick_list::Handle, tooltip, tooltip::Position},
     Color, Event,
 };
 
@@ -94,10 +95,12 @@ const EXECUTING: char = '\u{ef64}';
 const SUCCESSFUL: char = '\u{e877}';
 const EXEC_ERR: char = '\u{e000}';
 const ERROR: char = '\u{e001}';
+const TIMED_OUT: char = '\u{e51d}';
 
 const DELETE: char = '\u{e872}';
 const REFRESH: char = '\u{e5d5}';
 const EDIT: char = '\u{e3c9}';
+const COPY: char = '\u{e14d}';
 const VIEW_LOG: char = '\u{f1c3}';
 const VIEW_ERROR_LOG: char = '\u{e87f}';
 const ADD_ACTION: char = '\u{e146}';
@@ -135,6 +138,7 @@ pub enum Message {
     Config(ConfigAction),
     Screenshot(usize, bool),
     RefreshAddr,
+    CopyToClipboard(SmolStr),
     None,
 }
 
@@ -180,7 +184,7 @@ struct Client {
 impl Client {
     async fn connect(&self) -> Result<client::Handle<ClientHandler>, russh::Error> {
         let config = client::Config {
-            connection_timeout: Some(Duration::from_secs(5)),
+            connection_timeout: Some(Duration::from_secs(10)),
             ..<_>::default()
         };
 
@@ -197,7 +201,7 @@ impl Client {
     async fn exec(
         &self,
         info: &mut ClientInfo,
-        command: SmolStr,
+        command: &str,
         data: Option<&[u8]>,
         reply: bool,
     ) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>, u32), russh::Error> {
@@ -249,7 +253,7 @@ impl Client {
             info,
             ["scp", "/dev/stdin", path.to_string_lossy().as_ref()]
                 .join(" ")
-                .into(),
+                .as_str(),
             Some(data),
             true,
         )
@@ -266,7 +270,7 @@ impl Client {
             info,
             ["scp", path.to_string_lossy().as_ref(), "/dev/stdout"]
                 .join(" ")
-                .into(),
+                .as_str(),
             None,
             true,
         )
@@ -364,6 +368,7 @@ type ArgumentsMap = Arc<IndexSet<SmolStr>>;
 pub struct ActionDesc {
     description: SmolStr,
     command: SmolStr,
+    timeout: u64,
     // #[serde(with = "SerHexOpt::<Compact>")]
     logo: Option<u32>,
     need_reply: bool,
@@ -401,6 +406,7 @@ impl ActionDesc {
     ) -> Self {
         let args = Self::generate_args(&command);
         Self {
+            timeout: 15,
             description,
             command,
             logo,
@@ -469,7 +475,7 @@ struct Config {
     clients: IndexSet<Arc<Client>>,
     actions: Vec<ActionDesc>,
     screenshot_path: SmolStr,
-    credentials: IndexSet<Cred>,
+    // credentials: IndexSet<Cred>,
 }
 
 #[derive(Serialize, Deserialize, Hash, PartialEq, Eq)]
@@ -501,7 +507,7 @@ impl Default for Config {
             clients: [].into(),
             actions: [].into(),
             screenshot_path: "/tmp/screenshot.png".into(),
-            credentials: [].into(),
+            // credentials: [].into(),
         }
     }
 }
@@ -664,6 +670,9 @@ impl Application for Data {
 
     fn update(&mut self, message: Self::Message) -> Command<Self::Message> {
         match message {
+            Message::CopyToClipboard(str) => {
+                return clipboard::write(str.to_string());
+            }
             Message::RefreshAddr => {
                 self.clients_version.fetch_add(1, Ordering::Relaxed);
             }
@@ -831,6 +840,8 @@ impl Application for Data {
                                 a.command.deref().to_owned()
                             });
 
+                            let need_reply = a.need_reply;
+                            let action_timeout = a.timeout;
                             let clients = self
                                 .config
                                 .clients
@@ -846,111 +857,72 @@ impl Application for Data {
                                     Command::perform(
                                         async move {
                                             let mut info = c.info.lock().await;
-                                            //todo needreply
-                                            match dbg!(c.exec(&mut info, command, None, true).await)
-                                            {
-                                                Ok((stdout, stderr, exit_status)) => {
-                                                    info.output.push_back(Log {
-                                                        stdout: stdout.map(|s| {
-                                                            SmolStr::from(String::from_utf8_lossy(
-                                                                s.as_ref(),
-                                                            ))
-                                                        }),
-                                                        stderr: stderr.map(|s| {
-                                                            SmolStr::from(String::from_utf8_lossy(
-                                                                s.as_ref(),
-                                                            ))
-                                                        }),
-                                                        timestamp: chrono::offset::Local::now(),
-                                                    });
-                                                    info.status = if exit_status == 0 {
-                                                        SUCCESSFUL
-                                                    } else {
-                                                        EXEC_ERR
-                                                    };
-                                                }
-                                                Err(e) => {
-                                                    info.msg = SmolStr::from(e.to_string());
-                                                    info.status = ERROR;
-                                                    use russh::Error;
-                                                    match e {
-                                                        Error::Disconnect => {
-                                                            info.connection = None;
+                                            timeout(Duration::from_secs(action_timeout), async {
+                                                for _ in 0..3 {
+                                                    match dbg!(
+                                                        c.exec(
+                                                            &mut info,
+                                                            command.as_str(),
+                                                            None,
+                                                            need_reply
+                                                        )
+                                                        .await
+                                                    ) {
+                                                        Ok((stdout, stderr, exit_status)) => {
+                                                            info.output.push_back(Log {
+                                                                stdout: stdout.map(|s| {
+                                                                    SmolStr::from(
+                                                                        String::from_utf8_lossy(
+                                                                            s.as_ref(),
+                                                                        ),
+                                                                    )
+                                                                }),
+                                                                stderr: stderr.map(|s| {
+                                                                    SmolStr::from(
+                                                                        String::from_utf8_lossy(
+                                                                            s.as_ref(),
+                                                                        ),
+                                                                    )
+                                                                }),
+                                                                timestamp:
+                                                                    chrono::offset::Local::now(),
+                                                            });
+                                                            info.status = if exit_status == 0 {
+                                                                SUCCESSFUL
+                                                            } else {
+                                                                EXEC_ERR
+                                                            };
+                                                            break;
                                                         }
-                                                        _ => {}
-                                                    };
+                                                        Err(e) => {
+                                                            info.msg = SmolStr::from(e.to_string());
+                                                            info.status = ERROR;
+                                                            use russh::Error;
+                                                            match e {
+                                                                Error::Disconnect
+                                                                | Error::SendError => {
+                                                                    info.connection = None;
+                                                                }
+                                                                _ => {}
+                                                            };
+                                                        }
+                                                    }
                                                 }
-                                            }
+                                            })
+                                            .await
+                                            .map_or_else(
+                                                |_| {
+                                                    info.msg = SmolStr::from("Action timed out");
+                                                    info.status = TIMED_OUT;
+                                                },
+                                                |_| {},
+                                            );
                                         },
                                         |_| Message::RefreshAddr,
                                     )
                                 });
 
                             return Command::batch(clients);
-
-                            // return Command::perform(
-                            //     async move {
-                            //         tokio_scoped::scope(|s| {
-                            //             for c in &clients {
-                            //                     s.spawn(async {
-                            //                         let mut info = c.info.lock().await;
-                            //                         let res: Result<_, async_ssh2_lite::Error> =
-                            //                             async {
-                            //                                 for _ in 0..3 {
-                            //                                     if let Some(ref session) = info.connection {
-                            //                                         let mut channel = session.channel_session().await?;
-                            //                                         channel.exec(&command).await?;
-                            //                                         let mut stdout = String::new();
-                            //                                         let mut stderr = String::new();
-                            //                                         channel.read_to_string(&mut stdout).await?;
-                            //                                         channel.stderr().read_to_string(&mut stderr).await?;
-                            //                                         info.output.push_back(Log { stdout: SmolStr::from(stdout), stderr: SmolStr::from(stderr), timestamp: chrono::offset::Local::now()});
-                            //                                         channel.close().await?;
-                            //                                         return Ok(if channel.exit_status()? == 0 {SUCCESSFUL} else {ERROR} );
-                            //                                     }
-                            //                                     else {
-                            //                                         let addr = (c.address.deref(), c.port).to_socket_addrs().map_err(|x| async_ssh2_lite::Error::Other(Box::new(x)))?.next().unwrap();
-
-                            //                                         let mut conf = SessionConfiguration::new();
-                            //                                         conf.set_timeout(5000);
-
-                            //                                         let mut conn =
-                            //                                             AsyncSession::<async_ssh2_lite::TokioTcpStream>::connect(
-                            //                                                 addr,
-                            //                                                 conf,
-                            //                                             )
-                            //                                             .await?;
-                            //                                         conn.handshake().await?;
-                            //                                         dbg!(conn.userauth_password(&c.user, &c.pass).await)?;
-                            //                                         info.connection = Some(conn);
-                            //                                     }
-                            //                                 }
-
-                            //                                 Ok(SSH_ERROR)
-                            //                                 // Err(async_ssh2_lite::Error::Other(Box::from(std::result::Result::Err("Unknown Error"))))
-                            //                             }
-                            //                             .await;
-
-                            //                          info.status = match dbg!(res) {
-                            //                             Ok(state) => state,
-                            //                             Err(err) => {
-                            //                                 use async_ssh2_lite::Error;
-                            //                                 info.msg = err.to_string().into();
-                            //                                 match err {
-                            //                                     Error::Ssh2(err)=> {
-                            //                                         AUTH_FAILED
-                            //                                     }
-                            //                                     _ => ERROR,
-                            //                                 }
-                            //                             },
-                            //                         };
-                            //                         // c.state.store(state as u32, Ordering::Relaxed);
-                            //                     });
-                            //             }
-                            //         });
-                            //     },
-                            //     |_| Message::RefreshAddr,
-                            // );
                         }
                     }
                 }
@@ -1065,7 +1037,7 @@ impl Application for Data {
                                 )
                                 .width(Length::Fill),
                                 text(c.port.to_string()).width(Length::Fill),
-                                tooltip(icon(state, 40), msg, Position::FollowCursor),
+                                tooltip(icon(state, 40), msg, Position::Bottom),
                                 button(icon(VIEW_LOG, 30))
                                     .on_press(Message::ShowDialog(Dialog::Logs(i, false)))
                                     .style(theme::Button::Text),
@@ -1224,25 +1196,33 @@ impl Application for Data {
                 let output = if let Some(client) = self.config.clients.get_index(index) && let Some(info) = client.info.try_lock() {
                     column(info.output.iter().rev().filter_map(|o| {
                         if show_error && let Some(ref output) = o.stderr {
-                            Some(Card::new(text(o.timestamp.format("%Y-%m-%d %H:%M:%S")), text(output)))
+                            Some(Card::new(row![
+                                text(o.timestamp.format("%Y-%m-%d %H:%M:%S")), horizontal_space(Length::Fill),
+                                button(icon(COPY, 20))
+                                    .on_press(Message::CopyToClipboard(output.clone()))
+                                    .padding(10),], text(output)))
                         } else if !show_error && let Some(ref output) = o.stdout {
-                            Some(Card::new(text(o.timestamp.format("%Y-%m-%d %H:%M:%S")), text(output)))
+                            Some(Card::new(row![
+                                text(o.timestamp.format("%Y-%m-%d %H:%M:%S")), horizontal_space(Length::Fill),
+                                button(icon(COPY, 20))
+                                    .on_press(Message::CopyToClipboard(output.clone()))
+                                    .padding(10),], text(output)))
                         } else {
                             None
                         }
                     }).map(Element::from).collect())
                 } else {
                     column![text("Unable to load logs")]
-                };
+                }.spacing(5);
                 scrollable(
                     Card::new(
                         "Logs",
                         container(column![
-                            checkbox("Show Error", show_error, move |state| Message::ShowDialog(
+                            container(checkbox("Show Error", show_error, move |state| Message::ShowDialog(
                                 Dialog::Logs(index, state)
-                            )),
+                            ))).width(Length::Fill).align_x(alignment::Horizontal::Left),
                             output
-                        ])
+                        ].spacing(5))
                         .width(Length::Fixed(500.0))
                         .padding(20)
                         .align_x(alignment::Horizontal::Center)
@@ -1274,8 +1254,10 @@ impl Application for Data {
                             .map(|(i, (title, tip))| {
                                 row![
                                     text(title),
+                                    horizontal_space(Length::Fill),
                                     text_input(tip, &inputs[i]) .width(Length::Fill)
                                         .on_input(move |str| Message::DialogInput(i, str))
+                                        .width(Length::Fixed(300.))
                                 ]
                                 .spacing(10)
                                 .into()
@@ -1284,7 +1266,7 @@ impl Application for Data {
                         )
                         .push(button("Add").on_press(Message::AddAction(index))),
                     )
-                    .width(Length::Fixed(300.0))
+                    .width(Length::Fixed(500.0))
                     .padding(20)
                     .align_x(alignment::Horizontal::Center)
                     .align_y(alignment::Vertical::Center)
@@ -1313,8 +1295,9 @@ impl Application for Data {
                                         arg.next().map(|a| {
                                         row![
                                             text(a),
+                                            horizontal_space(Length::Fill),
                                             text_input(arg.next().unwrap_or(""), &inputs[i],)
-                                                .width(Length::Fill)
+                                                .width(Length::Fixed(300.))
                                                 .on_input(move |str| Message::DialogInput(i, str))
                                         ]
                                         .spacing(20)
@@ -1334,7 +1317,7 @@ impl Application for Data {
                                 .align_x(alignment::Horizontal::Right),
                             ),
                         )
-                        .width(Length::Fixed(300.0))
+                        .width(Length::Fixed(500.0))
                         .padding(20)
                         .align_x(alignment::Horizontal::Center)
                         .align_y(alignment::Vertical::Center)
@@ -1353,28 +1336,25 @@ impl Application for Data {
                 // let png = png.to_owned();
                 Modal::new(true, content, move || {
                     Card::new(
-                        "Screenshot",
-                        container(
-                            column![
-                                button(icon(REFRESH, 20))
+                        row![text("Screenshot"), horizontal_space(Length::Fill), button(icon(REFRESH, 20))
                                     .on_press(Message::Screenshot(index, false))
-                                    .padding(10),
+                                    .style(theme::Button::Text),
+                                    ],
+                        container(
                                 if let Some(client) = self.config.clients.get_index(index) && let Some(png) = client.screenshot.try_lock() && let Some(ref png) = *png {
                                     Element::from(image(iced::widget::image::Handle::from_memory(png.clone())))
 
                                 } else {
                                     text("Unable to fetch screenshot").into()
                                 }
-                            ]
                         )
-                        .width(Length::Fixed(1080.0))
                         .padding(20)
                         .align_x(alignment::Horizontal::Center)
                         .align_y(alignment::Vertical::Center)
                         .center_x()
                         .center_y(),
                     )
-                    .width(Length::Shrink)
+                    .width(Length::Fixed(1080.0))
                     .height(Length::Shrink)
                     .style(CardStyles::Secondary)
                     .into()
